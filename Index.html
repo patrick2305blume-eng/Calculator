@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CGM-Rechner</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+:root{--bg:#f6f7f5;--fg:#16221f;--mut:#5d6b67;--line:#d5dcd9;--card:#fff;--acc:#0f5c4d;
+--low:#b3261e;--vlow:#7a0f0a;--ok:#2e8b57;--high:#e0a21b;--vhigh:#d4631b}
+@media(prefers-color-scheme:dark){:root{--bg:#10171a;--fg:#e6ecea;--mut:#94a3a0;--line:#2a3735;--card:#172124;--acc:#4fc3a8}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,sans-serif}
+main{max-width:860px;margin:0 auto;padding:20px 16px 48px}
+h1{font-size:1.6rem;margin:.2em 0}h2{font-size:1.1rem;margin:1.6em 0 .5em}
+p.sub{color:var(--mut);margin:0 0 1em}
+#drop{border:2px dashed var(--acc);border-radius:10px;padding:28px 16px;text-align:center;cursor:pointer;background:var(--card)}
+#drop.over{background:color-mix(in srgb,var(--acc) 12%,var(--card))}
+.row{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}
+label{font-size:.9rem;color:var(--mut)}
+select,input[type=number]{font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg);width:100%}
+.row>div{flex:1 1 140px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.m{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+.m b{display:block;font-size:1.4rem}.m span{font-size:.85rem;color:var(--mut)}
+table{width:100%;border-collapse:collapse;background:var(--card);font-size:.92rem}
+td,th{padding:7px 10px;border-bottom:1px solid var(--line);text-align:left}
+td.n,th.n{text-align:right}
+canvas{width:100%;background:var(--card);border:1px solid var(--line);border-radius:8px}
+.bar{display:flex;height:26px;border-radius:6px;overflow:hidden;margin:8px 0}
+.warn{background:color-mix(in srgb,var(--high) 18%,var(--card));border-left:4px solid var(--high);padding:8px 12px;border-radius:4px;font-size:.9rem}
+.err{color:var(--low)}
+footer{margin-top:32px;font-size:.82rem;color:var(--mut)}
+:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+</style>
+</head>
+<body>
+<main>
+<h1>CGM-Rechner</h1>
+<p class="sub">PDF (oder CSV/TXT) mit Glukosedaten hochladen. Die Auswertung läuft komplett in deinem Browser, nichts wird hochgeladen.</p>
+
+<div id="drop" tabindex="0" role="button" aria-label="Dateien auswählen">
+  Dateien hierher ziehen oder tippen zum Auswählen
+  <input id="file" type="file" accept=".pdf,.csv,.txt" multiple hidden>
+</div>
+
+<div class="row">
+  <div><label for="range1">Zielbereich von</label><input id="range1" type="number" value="70" step="1"></div>
+  <div><label for="range2">Zielbereich bis</label><input id="range2" type="number" value="180" step="1"></div>
+  <div><label for="dfmt">Datum bei „/“</label>
+    <select id="dfmt"><option value="mdy">MM/TT/JJJJ</option><option value="dmy">TT/MM/JJJJ</option></select></div>
+  <div><label for="unit">Einheit der Werte</label>
+    <select id="unit"><option value="auto">automatisch</option><option value="mgdl">mg/dl</option><option value="mmol">mmol/l</option></select></div>
+</div>
+<p class="sub">Zielbereich in mg/dl; Standard 70–180 (internationaler Konsens).</p>
+
+<div id="msg"></div>
+<div id="out" hidden>
+  <h2>Kennzahlen</h2><div class="grid" id="kpis"></div>
+  <h2>Zeit in Bereichen</h2><div class="bar" id="bar"></div><table id="tir"></table>
+  <h2>Verlauf</h2><canvas id="cv" width="860" height="320"></canvas>
+  <h2>Erkannte Messwerte (erste 15)</h2><table id="prev"></table>
+</div>
+
+<footer>Keine medizinische Beratung und kein Medizinprodukt. PDF-Layouts unterscheiden sich je nach Hersteller; kontrolliere immer die erkannten Messwerte. Besprich Ergebnisse mit deinem Behandlungsteam.</footer>
+</main>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+const $=id=>document.getElementById(id);
+const MMOL=18.016;
+
+/* ---------- Einlesen ---------- */
+async function pdfLines(file){
+  const pdf=await pdfjsLib.getDocument({data:await file.arrayBuffer()}).promise;
+  const lines=[];
+  for(let p=1;p<=pdf.numPages;p++){
+    const tc=await (await pdf.getPage(p)).getTextContent();
+    const rows=new Map();
+    for(const it of tc.items){
+      if(!it.str.trim())continue;
+      const y=Math.round(it.transform[5]/3);
+      if(!rows.has(y))rows.set(y,[]);
+      rows.get(y).push({x:it.transform[4],s:it.str});
+    }
+    [...rows.keys()].sort((a,b)=>b-a).forEach(y=>
+      lines.push(rows.get(y).sort((a,b)=>a.x-b.x).map(i=>i.s).join(" ")));
+  }
+  return lines;
+}
+async function fileLines(f){
+  if(/\.pdf$/i.test(f.name))return pdfLines(f);
+  return (await f.text()).split(/\r?\n/);
+}
+
+/* ---------- Parser (heuristisch) ---------- */
+const RE=/(\d{4}-\d{2}-\d{2}|\d{1,2}[.\/]\d{1,2}[.\/]\d{2,4})[,T;\s]+(\d{1,2}):(\d{2})(?::\d{2})?\s*([AaPp][Mm])?(.*)$/;
+function parse(lines){
+  const out=[];
+  for(const l of lines){
+    const m=RE.exec(l); if(!m)continue;
+    let y,mo,d; const ds=m[1];
+    if(ds.includes("-")){[y,mo,d]=ds.split("-").map(Number);}
+    else{
+      const sep=ds.includes(".")?".":"/"; let [a,b,c]=ds.split(sep).map(Number);
+      if(c<100)c+=2000;
+      const dmy=sep==="."||a>12||$("dfmt").value==="dmy";
+      if(dmy){d=a;mo=b}else{mo=a;d=b}
+      y=c;
+    }
+    let h=+m[2]; const ap=(m[4]||"").toLowerCase();
+    if(ap==="pm"&&h<12)h+=12; if(ap==="am"&&h===12)h=0;
+    const nums=[...m[5].matchAll(/(\d{1,3}(?:[.,]\d)?)(?!\d)/g)].map(x=>parseFloat(x[1].replace(",","."))); 
+    const v=nums.find(n=>(n>=20&&n<=600)||(n>=1.1&&n<=33.3));
+    if(v===undefined||isNaN(new Date(y,mo-1,d,h,+m[3])))continue;
+    out.push({t:new Date(y,mo-1,d,h,+m[3]).getTime(),v});
+  }
+  const seen=new Set();
+  return out.filter(r=>!seen.has(r.t)&&seen.add(r.t)).sort((a,b)=>a.t-b.t);
+}
+
+/* ---------- Berechnung ---------- */
+const avg=a=>a.reduce((s,x)=>s+x,0)/a.length;
+function stats(vals,lo,hi){
+  const n=vals.length,mean=avg(vals);
+  const sd=Math.sqrt(vals.reduce((s,x)=>s+(x-mean)**2,0)/(n-1||1));
+  const pct=f=>100*vals.filter(f).length/n;
+  return{n,mean,sd,cv:100*sd/mean,gmi:3.31+0.02392*mean,
+    vlow:pct(x=>x<54),low:pct(x=>x>=54&&x<70),
+    inr:pct(x=>x>=lo&&x<=hi),
+    high:pct(x=>x>hi&&x<=250),vhigh:pct(x=>x>250),
+    belowTarget:pct(x=>x<lo),aboveTarget:pct(x=>x>hi)};
+}
+
+/* ---------- Anzeige ---------- */
+const f1=x=>x.toFixed(1).replace(".",",");
+function render(data,mmol){
+  const lo=+$("range1").value,hi=+$("range2").value;
+  const vals=data.map(r=>mmol?r.v*MMOL:r.v);
+  const s=stats(vals,lo,hi);
+  const days=(data.at(-1).t-data[0].t)/864e5;
+  const u=mmol?"mmol/l":"mg/dl",cv=x=>mmol?f1(x/MMOL):Math.round(x);
+  $("kpis").innerHTML=[
+    [`${cv(s.mean)}`,`Mittelwert (${u})`],
+    [`${cv(s.sd)}`,`Standardabweichung (${u})`],
+    [`${f1(s.cv)} %`,`Variationskoeffizient (Ziel ≤ 36 %)`],
+    [`${f1(s.gmi)} %`,`GMI (geschätzter HbA1c)`],
+    [`${s.n}`,`Messwerte`],
+    [`${f1(days)}`,`Tage Zeitraum`],
+    [`${f1(100*s.n/Math.max(days*96,1))} %`,`Abdeckung (bei 15-Min-Takt)`]
+  ].map(([b,l])=>`<div class="m"><b>${b}</b><span>${l}</span></div>`).join("");
+
+  const rows=[["Sehr niedrig (< 54)",s.vlow,"var(--vlow)"],["Niedrig (54–69)",s.low,"var(--low)"],
+    [`Im Zielbereich (${lo}–${hi})`,s.inr,"var(--ok)"],["Hoch (181–250)",s.high,"var(--high)"],["Sehr hoch (> 250)",s.vhigh,"var(--vhigh)"]];
+  $("bar").innerHTML=rows.map(r=>`<div style="width:${r[1]}%;background:${r[2]}" title="${r[0]}"></div>`).join("");
+  $("tir").innerHTML=`<tr><th>Bereich (mg/dl)</th><th class="n">Anteil</th></tr>`+
+    rows.map(r=>`<tr><td>${r[0]}</td><td class="n">${f1(r[1])} %</td></tr>`).join("")+
+    `<tr><td>Unter Zielbereich gesamt</td><td class="n">${f1(s.belowTarget)} %</td></tr>
+     <tr><td>Über Zielbereich gesamt</td><td class="n">${f1(s.aboveTarget)} %</td></tr>`;
+  $("prev").innerHTML=`<tr><th>Zeitpunkt</th><th class="n">Wert (${u})</th></tr>`+
+    data.slice(0,15).map(r=>`<tr><td>${new Date(r.t).toLocaleString("de-DE")}</td><td class="n">${r.v}</td></tr>`).join("");
+  chart(data,vals,lo,hi);
+  $("out").hidden=false;
+}
+function chart(data,vals,lo,hi){
+  const c=$("cv"),g=c.getContext("2d"),W=c.width,H=c.height,P=34;
+  const css=getComputedStyle(document.documentElement);
+  g.clearRect(0,0,W,H);
+  const t0=data[0].t,t1=data.at(-1).t,mx=Math.max(300,...vals);
+  const X=t=>P+(t-t0)/(t1-t0||1)*(W-P-8),Y=v=>H-20-(v/mx)*(H-30);
+  g.fillStyle=css.getPropertyValue("--ok").trim()+"22";g.fillRect(P,Y(hi),W-P-8,Y(lo)-Y(hi));
+  g.strokeStyle=css.getPropertyValue("--line");g.fillStyle=css.getPropertyValue("--mut");g.font="11px system-ui";
+  for(let v=0;v<=mx;v+=50){g.beginPath();g.moveTo(P,Y(v));g.lineTo(W-8,Y(v));g.stroke();g.fillText(v,2,Y(v)+4);}
+  g.strokeStyle=css.getPropertyValue("--acc");g.lineWidth=1.5;g.beginPath();
+  let prev=null;
+  data.forEach((r,i)=>{const x=X(r.t),y=Y(vals[i]);
+    if(prev===null||r.t-prev>45*6e4)g.moveTo(x,y);else g.lineTo(x,y);prev=r.t;});
+  g.stroke();
+}
+
+/* ---------- Ablauf ---------- */
+async function handle(files){
+  $("msg").innerHTML="";$("out").hidden=true;
+  let all=[];
+  try{
+    for(const f of files)all=all.concat(parse(await fileLines(f)));
+  }catch(e){$("msg").innerHTML=`<p class="err">Datei konnte nicht gelesen werden: ${e.message}</p>`;return;}
+  const seen=new Set();all=all.filter(r=>!seen.has(r.t)&&seen.add(r.t)).sort((a,b)=>a.t-b.t);
+  if(all.length<10){
+    $("msg").innerHTML=`<p class="warn">Es wurden nur ${all.length} Messwerte mit Datum, Uhrzeit und Wert erkannt. Viele PDF-Berichte enthalten nur Zusammenfassungen (z. B. AGP-Kurve) ohne Einzelwerte. Exportiere die Rohdaten als CSV oder PDF-Datenliste aus der Hersteller-Software.</p>`;
+    return;
+  }
+  const u=$("unit").value;
+  const med=[...all].map(r=>r.v).sort((a,b)=>a-b)[Math.floor(all.length/2)];
+  const mmol=u==="mmol"||(u==="auto"&&med<35);
+  render(all,mmol);
+  $("range1").onchange=$("range2").onchange=()=>render(all,mmol);
+}
+const drop=$("drop"),inp=$("file");
+drop.onclick=()=>inp.click();
+drop.onkeydown=e=>{if(e.key==="Enter"||e.key===" ")inp.click()};
+inp.onchange=()=>inp.files.length&&handle([...inp.files]);
+["dragover","dragenter"].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add("over")}));
+["dragleave","drop"].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove("over")}));
+drop.addEventListener("drop",e=>handle([...e.dataTransfer.files]));
+</script>
+</body>
+</html>
